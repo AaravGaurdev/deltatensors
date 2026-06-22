@@ -9,7 +9,7 @@ Example case would be something like:
 
 ```
 base_model.safetensors   15 GB
-checkpoint_01.wdelta        120 MB   (sparse, sparsity=0.9)
+checkpoint_01.wdelta        120 MB  
 checkpoint_02.wdelta        118 MB
 ...
 checkpoint_50.wdelta        115 MB
