@@ -1,0 +1,22 @@
+# Virtual Environment
+Include/
+Lib/
+site-packages/
+Scripts/
+share/
+pyvenv.cfg
+
+# Python Caches & Dependencies
+.pytest_cache/
+__pycache__/
+*.pyc
+requires.txt
+
+# Local Testing Files
+qwen-base-small/
+qwen-ft-small/
+qwen-wiki/
+*.wdelta
+archive/
+qwenDeltaCheck.py
+compareWikis.py
