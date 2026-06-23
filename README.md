@@ -62,6 +62,10 @@ LoRA constrains the delta to be low-rank *during training*, which limits express
 
 - **Lineage** — chain multiple `.wdelta` files to track and reconstruct full fine-tuning histories
 
+
 ## License
 
 MIT
+
+--- 
+p.s. *If you find `deltatensors` useful, please consider leaving a ⭐ star on the repository to help others find it!*
