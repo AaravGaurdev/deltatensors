@@ -13,4 +13,4 @@ from .io import save_delta, save_delta_from_paths, load_delta, load_delta_from_p
 from .lineage import hash_state_dict
 
 __version__ = "0.1.0"
-__all__ = ["save_delta", "save_delta_from_paths", "load_delta", "load_delta_from_paths", "inspect", "hash_state_dict"]
+__all__ = ["save_delta", "save_delta_from_paths", "load_delta", "load_delta_from_paths", "inspect"]

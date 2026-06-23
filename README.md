@@ -58,6 +58,10 @@ print(info)
 
 LoRA constrains the delta to be low-rank *during training*, which limits expressiveness. `deltatensors` compresses arbitrary full fine-tune deltas *after training* - no constraints on how you fine-tune.
 
+## Roadmap
+
+- **Lineage** — chain multiple `.wdelta` files to track and reconstruct full fine-tuning histories
+
 ## License
 
 MIT
