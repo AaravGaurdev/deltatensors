@@ -23,7 +23,7 @@ dt.save_delta_from_paths(
 )
 ```
 
-This streams tensor pairs from disk one at a time — peak RAM is O(1 tensor), not O(two full models).
+This streams tensor pairs from disk one at a time. Peak RAM is O(1 tensor), not O(two full models).
 
 ### Reconstruct
 
@@ -35,7 +35,7 @@ recon_sd = dt.load_delta_from_paths(
 )
 ```
 
-Returns a `Dict[str, np.ndarray]` — the reconstructed state dict.
+Returns a `Dict[str, np.ndarray]`, which is the reconstructed state dict.
 
 ### Load into a HuggingFace model
 
@@ -61,7 +61,7 @@ for name, payload in compressed_tensors.items():
 model.load_state_dict(sd, strict=False)
 ```
 
-This patches the base model in-place — peak RAM is one model + one delta tensor at a time.
+This patches the base model in-place. Peak RAM is one model + one delta tensor at a time.
 
 ### Inspect a delta file
 
@@ -89,4 +89,16 @@ print(info)
 | `sparse` | You want a tunable quality/compression tradeoff |
 | `quantized` | You want maximum compression and can tolerate more loss |
 
-## In-memory usage (small
+## In-memory usage (small models)
+
+If your models fit in RAM, you can pass state dicts directly:
+
+```python
+import numpy as np
+
+finetuned_sd = {...}  # Dict[str, np.ndarray] or Dict[str, torch.Tensor]
+base_sd = {...}
+
+dt.save_delta("checkpoint.wdelta", finetuned_sd, base_sd, strategy="int4")
+recon_sd = dt.load_delta("checkpoint.wdelta", base_sd, verify=True)
+```
