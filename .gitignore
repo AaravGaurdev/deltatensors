@@ -20,3 +20,11 @@ qwen-wiki/
 archive/
 qwenDeltaCheck.py
 compareWikis.py
+
+# build artifacts
+dist/
+build/
+*.egg-info/
+
+# readthedocs/mkdocs
+site/
