@@ -2,7 +2,7 @@
 
 **Near-lossless delta compression for fine-tuned neural network models.**
 
-Instead of storing fifty fine-tunes of the same base model, store one base and fifty small `.wdelta` delta files. `deltatensors` compresses the delta between a base and fine-tuned model, and reconstructs with sub-1% perplexity difference.
+Instead of storing 50 fine-tunes of the same base model, store one base and 50 small `.wdelta` delta files. `deltatensors` compresses the delta between a base and fine-tuned model, and reconstructs with sub-1% perplexity difference.
 
 **Tested on Qwen2.5-0.5B fine-tuned on WikiText-2:**
 - Perplexity: 19.11 (original) → 19.22 (reconstructed) — 0.58% perplexity difference
