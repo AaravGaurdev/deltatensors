@@ -1,8 +1,8 @@
 site_name: deltatensors
 site_description: Near-lossless delta compression for fine-tuned neural network models
 site_url: https://deltatensors.readthedocs.io
-repo_url: https://github.com/aaravgaur/deltatensors
-repo_name: aaravgaur/deltatensors
+repo_url: https://github.com/AaravGaurdev/deltatensors
+repo_name: AaravGaurdev/deltatensors
 
 theme:
   name: material
