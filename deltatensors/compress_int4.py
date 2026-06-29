@@ -17,22 +17,40 @@ from __future__ import annotations
 import numpy as np
 from typing import Dict, Any
 
+try:
+    import cupy as cp
+except ImportError:
+    cp = None  # type: ignore
+
+
+def _xp(arr):
+    if cp is not None and isinstance(arr, cp.ndarray):
+        return cp
+    return np
+
+
+def _to_numpy(arr) -> np.ndarray:
+    if cp is not None and isinstance(arr, cp.ndarray):
+        return cp.asnumpy(arr)
+    return np.asarray(arr)
+
 
 # ---------------------------------------------------------------------------
 # Bit packing helpers
 # ---------------------------------------------------------------------------
 
-def _pack_int4(values: np.ndarray) -> np.ndarray:
+def _pack_int4(values) -> np.ndarray:
     """
     Pack an array of int4 values (0-15) into uint8 bytes.
     Two int4 values per byte: high nibble = values[2i], low nibble = values[2i+1].
-    Pads with a zero nibble if length is odd.
+    Pads with a zero nibble if length is odd. Accepts numpy or cupy; returns numpy.
     """
-    flat = values.flatten().astype(np.uint8)
+    xp = _xp(values)
+    flat = values.flatten().astype(xp.uint8)
     if len(flat) % 2 != 0:
-        flat = np.append(flat, np.uint8(0))  # pad
+        flat = xp.concatenate([flat, xp.zeros(1, dtype=xp.uint8)])
     packed = (flat[0::2] << 4) | (flat[1::2] & 0x0F)
-    return packed.astype(np.uint8)
+    return _to_numpy(packed.astype(xp.uint8))
 
 
 def _unpack_int4(packed: np.ndarray, n_elements: int) -> np.ndarray:
@@ -53,11 +71,12 @@ def _unpack_int4(packed: np.ndarray, n_elements: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def compress_int4(
-    delta: np.ndarray,
+    delta,
     outlier_fraction: float = 0.01,
 ) -> Dict[str, Any]:
     """
     Compress a delta tensor using outlier extraction + 4-bit quantization.
+    Accepts numpy or cupy arrays; always returns numpy arrays.
 
     Args:
         delta:            Float32 delta array (finetuned - base).
@@ -67,45 +86,44 @@ def compress_int4(
     Returns:
         Payload dict compatible with deltatensors compress/decompress dispatch.
     """
+    xp = _xp(delta)
     orig_shape = delta.shape
     orig_dtype = str(delta.dtype)
-    flat = delta.flatten().astype(np.float32)
+    flat = delta.flatten().astype(xp.float32)
     n = len(flat)
 
     # --- step 1: identify outliers by magnitude ---
     n_outliers = max(1, int(n * outlier_fraction))
-    abs_flat = np.abs(flat)
-    # argpartition is O(n) — faster than full sort
-    outlier_idx = np.argpartition(abs_flat, -n_outliers)[-n_outliers:]
-    outlier_idx = np.sort(outlier_idx).astype(np.int64)
-    outlier_vals = flat[outlier_idx].astype(np.float16)
+    abs_flat = xp.abs(flat)
+    outlier_idx = xp.argpartition(abs_flat, -n_outliers)[-n_outliers:]
+    outlier_idx = xp.sort(outlier_idx).astype(xp.int64)
+    outlier_vals = flat[outlier_idx].astype(xp.float16)
 
     # --- step 2: mask out outliers for quantization ---
-    mask = np.ones(n, dtype=bool)
+    mask = xp.ones(n, dtype=bool)
     mask[outlier_idx] = False
     non_outlier_vals = flat[mask]  # shape: (n - n_outliers,)
 
     # --- step 3: asymmetric min-max 4-bit quantization ---
-    q_min = non_outlier_vals.min()
-    q_max = non_outlier_vals.max()
+    # float() syncs GPU scalar → Python float (cheap for a single value)
+    q_min = float(non_outlier_vals.min())
+    q_max = float(non_outlier_vals.max())
     q_range = q_max - q_min
 
     if q_range < 1e-8:
-        # constant delta — quantize to all zeros
         scale = np.float16(1.0)
         zero_point = np.float16(q_min)
-        quantized = np.zeros(len(non_outlier_vals), dtype=np.uint8)
+        quantized = xp.zeros(len(non_outlier_vals), dtype=xp.uint8)
     else:
-        scale = np.float16(q_range / 15.0)          # 4-bit: 0..15
+        scale = np.float16(q_range / 15.0)
         zero_point = np.float16(q_min)
-        # clamp to [0, 15] to handle float16 rounding
-        quantized = np.clip(
-            np.round((non_outlier_vals - q_min) / q_range * 15.0),
+        quantized = xp.clip(
+            xp.round((non_outlier_vals - q_min) / q_range * 15.0),
             0, 15
-        ).astype(np.uint8)
+        ).astype(xp.uint8)
 
     # --- step 4: bit-pack int4 pairs into uint8 ---
-    packed = _pack_int4(quantized)
+    packed = _pack_int4(quantized)  # returns numpy
 
     return {
         "strategy":         "int4",
@@ -114,10 +132,8 @@ def compress_int4(
         "outlier_fraction": outlier_fraction,
         "n_elements":       n,
         "n_outliers":       n_outliers,
-        # outliers
-        "outlier_idx":      outlier_idx,
-        "outlier_vals":     outlier_vals,
-        # non-outlier quantization params
+        "outlier_idx":      _to_numpy(outlier_idx),
+        "outlier_vals":     _to_numpy(outlier_vals),
         "scale":            np.array([scale], dtype=np.float16),
         "zero_point":       np.array([zero_point], dtype=np.float16),
         "packed":           packed,

@@ -7,6 +7,8 @@ pip install deltatensors
 pip install torch safetensors  # for loading from safetensors directories
 ```
 
+Requires Python 3.9+.
+
 ## Basic usage
 
 ### Save a delta
@@ -69,7 +71,6 @@ Peak RAM here is one loaded model + one delta tensor at a time.
 
 ```python
 info = dt.inspect("checkpoint.wdelta")
-print(info)
 # {
 #   'path': 'checkpoint.wdelta',
 #   'size_mb': 294.2,
@@ -106,3 +107,117 @@ base_sd = {...}
 dt.save_delta("checkpoint.wdelta", finetuned_sd, base_sd, strategy="int4")
 recon_sd = dt.load_delta("checkpoint.wdelta", base_sd, verify=True)
 ```
+
+---
+
+## HuggingFace Trainer integration
+
+`DeltaTensorsCallback` hooks into the HuggingFace `Trainer` and saves each checkpoint as a `.wdelta` file automatically. The GPU is always free during the save (the callback forces CPU compression to avoid competing with optimizer states).
+
+```python
+from deltatensors.training import DeltaTensorsCallback
+from transformers import Trainer, TrainingArguments
+
+callback = DeltaTensorsCallback(
+    base_dir="path/to/base-model",   # the model training started from
+    strategy="int4",
+    outlier_fraction=0.05,
+    delete_full_checkpoint=False,     # True: saves disk, but can't resume or use load_best_model_at_end
+)
+
+trainer = Trainer(
+    model=model,
+    args=TrainingArguments(
+        output_dir="outputs",
+        save_steps=500,
+        ...
+    ),
+    callbacks=[callback],
+    ...
+)
+trainer.train()
+```
+
+After training, each checkpoint directory contains `model.wdelta` alongside (or instead of, if `delete_full_checkpoint=True`) the safetensors files:
+
+```
+outputs/
+  checkpoint-500/
+    model.wdelta        ← delta vs base_dir
+    model.safetensors   ← kept unless delete_full_checkpoint=True
+  checkpoint-1000/
+    model.wdelta
+    model.safetensors
+```
+
+Reconstruct any checkpoint:
+
+```python
+sd = dt.load_delta_from_paths(
+    "outputs/checkpoint-500/model.wdelta",
+    "path/to/base-model",
+)
+```
+
+**`delete_full_checkpoint=True` warning:** Removing the safetensors files saves disk but prevents resuming training from that checkpoint and prevents `load_best_model_at_end` from working. Only use it for checkpoints you won't resume from.
+
+---
+
+## Lineage chains
+
+Chains let you track a full fine-tuning history. Instead of each delta being against the original base, each delta is against the *prior reconstructed model* — so incremental updates stay small in magnitude:
+
+```
+base ──► v1.wdelta ──► v1_model ──► v2.wdelta ──► v2_model
+```
+
+The `parent_hash` field in each `.wdelta` file is the SHA-256 of the model it was computed against, forming a verifiable chain.
+
+### Save a chained delta
+
+```python
+# v1: normal delta vs base
+dt.save_delta_from_paths("v1.wdelta", "v1_checkpoint/", "base_model/", strategy="int4")
+
+# v2: chained delta vs reconstructed v1 (not vs base)
+dt.save_delta_chain_from_paths(
+    "v2.wdelta",
+    finetuned_dir="v2_checkpoint/",
+    parent_delta_path="v1.wdelta",
+    base_dir="base_model/",
+    strategy="int4",
+    outlier_fraction=0.05,
+)
+```
+
+`save_delta_chain_from_paths` is fully streaming — it reads the parent `.wdelta` one tensor at a time without ever reconstructing the full parent model in RAM.
+
+### Inspect chain metadata
+
+```python
+history = dt.inspect_chain(["v1.wdelta", "v2.wdelta", "v3.wdelta"])
+for entry in history:
+    print(f"step {entry['step']}: {entry['size_mb']:.1f} MB  parent={entry['parent_hash'][:8]}")
+```
+
+Returns a list of dicts with the same fields as `inspect()` plus a `step` index. No tensors are loaded.
+
+### Reconstruct the final model
+
+```python
+# Apply the full chain from base → v1 → v2
+sd = dt.load_delta_chain(
+    ["v1.wdelta", "v2.wdelta"],
+    base="base_model/",
+    verify=True,   # verifies parent_hash at each step
+)
+```
+
+With `verify=True`, applying deltas in the wrong order raises `ValueError: hash mismatch` immediately. Pass a directory path for `base` (uses the streaming loader for the first step) or an in-memory state dict.
+
+### Flat vs chained
+
+- **Flat**: all deltas computed against the original base. Each delta can be applied independently; reconstruction always requires only the base + one wdelta.
+- **Chained**: each delta computed against the prior model. Smaller delta magnitudes → better reconstruction quality at the same compression ratio. Reconstruction requires the full chain from the beginning.
+
+Use flat when checkpoints are independent experiments; use chained when you're tracking a sequential training trajectory (continual learning, multi-stage RLHF, iterative fine-tuning).

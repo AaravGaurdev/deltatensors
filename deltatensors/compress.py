@@ -10,32 +10,53 @@ from __future__ import annotations
 import numpy as np
 from typing import Dict, Any
 
+try:
+    import cupy as cp
+except ImportError:
+    cp = None  # type: ignore
+
+
+def _xp(arr):
+    """Return cupy if arr lives on GPU, else numpy."""
+    if cp is not None and isinstance(arr, cp.ndarray):
+        return cp
+    return np
+
+
+def _to_numpy(arr) -> np.ndarray:
+    """Move array to CPU numpy (no-op if already numpy)."""
+    if cp is not None and isinstance(arr, cp.ndarray):
+        return cp.asnumpy(arr)
+    return np.asarray(arr)
+
 
 # ---------------------------------------------------------------------------
 # Sparse
 # ---------------------------------------------------------------------------
 
-def compress_sparse(delta: np.ndarray, sparsity: float) -> Dict[str, Any]:
+def compress_sparse(delta, sparsity: float) -> Dict[str, Any]:
     """
     Keep only the top-(1-sparsity) fraction of delta weights by magnitude.
     Stores (indices, values, shape) — enough to reconstruct the full matrix.
+    Accepts numpy or cupy arrays; always returns numpy arrays.
     """
     if not 0.0 <= sparsity < 1.0:
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
 
+    xp = _xp(delta)
     flat = delta.flatten()
     k = max(1, int(len(flat) * (1.0 - sparsity)))
-    threshold_idx = np.argpartition(np.abs(flat), -k)[-k:]
-    indices = np.sort(threshold_idx).astype(np.int64)
-    values = flat[indices].astype(np.float32)
+    threshold_idx = xp.argpartition(xp.abs(flat), -k)[-k:]
+    indices = xp.sort(threshold_idx).astype(xp.int64)
+    values = flat[indices].astype(xp.float32)
 
     return {
         "strategy": "sparse",
         "shape": list(delta.shape),
         "dtype": str(delta.dtype),
         "sparsity": sparsity,
-        "indices": indices,
-        "values": values,
+        "indices": _to_numpy(indices),
+        "values": _to_numpy(values),
     }
 
 
@@ -49,30 +70,34 @@ def decompress_sparse(payload: Dict[str, Any]) -> np.ndarray:
 # Quantized (BitDelta-style)
 # ---------------------------------------------------------------------------
 
-def compress_quantized(delta: np.ndarray) -> Dict[str, Any]:
+def compress_quantized(delta) -> Dict[str, Any]:
     """
     1-bit sign mask with a learned per-row float16 scale.
     Reconstructed weight: scale[row] * sign[row, col]
+    Accepts numpy or cupy arrays; always returns numpy arrays.
     """
     orig_shape = delta.shape
     orig_dtype = str(delta.dtype)
+    xp = _xp(delta)
 
-    mat = delta.reshape(delta.shape[0], -1).astype(np.float32) if delta.ndim > 1 else delta.reshape(1, -1).astype(np.float32)
+    mat = (delta.reshape(delta.shape[0], -1).astype(xp.float32)
+           if delta.ndim > 1
+           else delta.reshape(1, -1).astype(xp.float32))
 
-    signs = np.sign(mat).astype(np.int8)
+    signs = xp.sign(mat).astype(xp.int8)
     signs[signs == 0] = 1
 
-    scales = np.mean(np.abs(mat), axis=1).astype(np.float16)
+    scales = xp.mean(xp.abs(mat), axis=1).astype(xp.float16)
 
-    sign_bits = (signs > 0).astype(np.uint8)
-    packed = np.packbits(sign_bits.flatten())
+    sign_bits = (signs > 0).astype(xp.uint8)
+    packed = xp.packbits(sign_bits.flatten())
 
     return {
         "strategy": "quantized",
         "shape": list(orig_shape),
         "dtype": orig_dtype,
-        "scales": scales,
-        "packed_signs": packed,
+        "scales": _to_numpy(scales),
+        "packed_signs": _to_numpy(packed),
         "n_elements": int(mat.shape[0] * mat.shape[1]),
         "n_cols": int(mat.shape[1]),
     }

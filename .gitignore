@@ -20,6 +20,7 @@ qwen-wiki/
 archive/
 qwenDeltaCheck.py
 compareWikis.py
+qwen*
 
 # build artifacts
 dist/
@@ -28,3 +29,4 @@ build/
 
 # readthedocs/mkdocs
 site/
+
