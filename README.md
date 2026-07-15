@@ -1,6 +1,5 @@
 # deltatensors
 
-**Triple your local fine-tune storage capacity.**
 
 `deltatensors` is a lightweight tool for post-training delta compression of fine-tuned neural network models
 
