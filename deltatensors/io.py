@@ -23,14 +23,21 @@ import json
 import struct
 import hashlib
 import queue
+import contextlib
 import threading
 from pathlib import Path
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 import numpy as np
 
 from .compress import compress, decompress
-from .format import write_wdelta, read_wdelta, MAGIC, VERSION, _ARRAY_FIELDS
+from .format import (
+    write_wdelta, WDeltaReader, MAGIC, VERSION, _ARRAY_FIELDS,
+    write_array_record, append_checksum,
+)
+from .compress_int4 import n_outliers_for
 from .lineage import hash_state_dict, verify_base
+from .safetensors_io import SafetensorsDir, to_float32, dtype_name
+from .reconstruct import load_delta_from_paths, reconstruct_to_safetensors, _verify_mode  # noqa: F401
 
 StateDict = Dict[str, Union[np.ndarray, "torch.Tensor"]]  # noqa: F821
 
@@ -60,148 +67,35 @@ _GPU_ELEMENT_THRESHOLD = 50_000_000
 
 
 def _to_numpy(state_dict: StateDict) -> Dict[str, np.ndarray]:
+    """numpy arrays for math; torch bfloat16 tensors become float32 (exactly)."""
     out = {}
     for k, v in state_dict.items():
         if isinstance(v, np.ndarray):
             out[k] = v
         else:
             try:
-                out[k] = v.detach().cpu().numpy()
+                t = v.detach().cpu()
             except AttributeError:
                 raise TypeError(f"Cannot convert tensor '{k}' of type {type(v)} to numpy.")
+            out[k] = t.float().numpy() if str(t.dtype) == "torch.bfloat16" else t.numpy()
     return out
 
 
-def _safetensors_keys(folder: str) -> list[str]:
-    import torch
-    try:
-        
-        from safetensors import safe_open
-    except ImportError:
-        raise ImportError("pip install torch safetensors to use save_delta_from_paths")
-    keys = []
-    for fname in sorted(os.listdir(folder)):
-        if fname.endswith(".safetensors"):
-            with safe_open(f"{folder}/{fname}", framework="pt", device="cpu") as f:
-                keys.extend(f.keys())
-    return sorted(keys)
+def _check_same_keys(a: set, b: set, a_name: str, b_name: str) -> None:
+    if a != b:
+        msg = f"Key mismatch between {a_name} and {b_name}."
+        if a - b:
+            msg += f"\n  Only in {a_name}: {sorted(a - b)}"
+        if b - a:
+            msg += f"\n  Only in {b_name}: {sorted(b - a)}"
+        raise ValueError(msg)
 
 
-def _get_tensor_numpy(folder: str, key: str) -> np.ndarray:
-    try:
-        import torch
-        from safetensors import safe_open
-    except ImportError:
-        raise ImportError("pip install safetensors torch to use save_delta_from_paths")
-    for fname in sorted(os.listdir(folder)):
-        if fname.endswith(".safetensors"):
-            with safe_open(f"{folder}/{fname}", framework="pt", device="cpu") as f:
-                if key in f.keys():
-                    return f.get_tensor(key).to(torch.float32).numpy()
-    raise KeyError(f"Tensor '{key}' not found in {folder}")
+def _raw_bytes(arr: np.ndarray) -> memoryview:
+    return memoryview(np.ascontiguousarray(arr).reshape(-1).view(np.uint8))
 
 
-def _get_tensor_numpy_raw(folder: str, key: str) -> np.ndarray:
-    try:
-        import torch
-        from safetensors import safe_open
-    except ImportError:
-        raise ImportError("pip install safetensors torch to use save_delta_from_paths")
-    for fname in sorted(os.listdir(folder)):
-        if fname.endswith(".safetensors"):
-            with safe_open(f"{folder}/{fname}", framework="pt", device="cpu") as f:
-                if key in f.keys():
-                    t = f.get_tensor(key)
-                    if t.dtype == torch.bfloat16:
-                        return t.view(torch.int16).numpy()
-                    return t.numpy()
-    raise KeyError(f"Tensor '{key}' not found in {folder}")
-
-
-def _build_key_to_shard(folder: str) -> dict:
-    """Map each tensor name to the shard filename it lives in."""
-    try:
-        from safetensors import safe_open
-    except ImportError:
-        raise ImportError("pip install safetensors to use save_delta_from_paths")
-    result = {}
-    for fname in sorted(os.listdir(folder)):
-        if fname.endswith(".safetensors"):
-            with safe_open(f"{folder}/{fname}", framework="pt", device="cpu") as f:
-                for k in f.keys():
-                    result[k] = fname
-    return result
-
-def _load_base_dir_numpy(folder: str, keys: list[str]) -> tuple[Dict[str, np.ndarray], str]:
-    """
-    Load requested keys from a safetensors folder, one file open per shard.
-    Returns (float32 arrays for math, sha256 hex of raw bytes for verify).
-    """
-    try:
-        import torch
-        from safetensors import safe_open
-    except ImportError:
-        raise ImportError("pip install safetensors torch to use save_delta_from_paths")
-
-    from collections import defaultdict
-
-    key_to_shard = {}
-    for fname in sorted(os.listdir(folder)):
-        if fname.endswith(".safetensors"):
-            with safe_open(f"{folder}/{fname}", framework="pt", device="cpu") as f:
-                for k in f.keys():
-                    key_to_shard[k] = fname
-
-    shard_to_keys = defaultdict(list)
-    for k in keys:
-        if k not in key_to_shard:
-            raise KeyError(f"Tensor '{k}' not found in {folder}")
-        shard_to_keys[key_to_shard[k]].append(k)
-
-    out = {}
-    hasher = hashlib.sha256()
-    for fname, shard_keys in shard_to_keys.items():
-        with safe_open(f"{folder}/{fname}", framework="pt", device="cpu") as f:
-            for k in sorted(shard_keys):  # sorted for determinism
-                t = f.get_tensor(k)
-                # raw bytes for hash (matches save side)
-                raw = t.view(torch.int16).numpy() if t.dtype == torch.bfloat16 else t.numpy()
-                hasher.update(k.encode("utf-8"))
-                hasher.update(raw.tobytes())
-                # float32 for math
-                if t.dtype == torch.bfloat16:
-                    t = t.to(torch.float32)
-                out[k] = t.numpy().astype(np.float32)
-
-    return out, hasher.hexdigest()
-
-
-_DTYPE_MAP_SAFETENSORS = {
-    "F32": "float32", "F16": "float16", "BF16": "bfloat16",
-    "F64": "float64", "I32": "int32", "I64": "int64",
-    "I16": "int16", "I8": "int8", "U8": "uint8", "BOOL": "bool",
-}
-
-
-def _safetensors_tensor_meta(folder: str) -> dict:
-    """Read tensor shapes/dtypes from safetensors headers without loading tensor data."""
-    result = {}
-    for fname in sorted(os.listdir(folder)):
-        if fname.endswith(".safetensors"):
-            with open(os.path.join(folder, fname), "rb") as f:
-                header_len = struct.unpack("<Q", f.read(8))[0]
-                header = json.loads(f.read(header_len).decode("utf-8"))
-            for name, meta in header.items():
-                if name == "__metadata__":
-                    continue
-                result[name] = {
-                    "shape": meta["shape"],
-                    "dtype": _DTYPE_MAP_SAFETENSORS.get(meta["dtype"], meta["dtype"].lower()),
-                }
-    return result
-
-
-def _tensor_header_entry(strategy: str, shape: list, kwargs: dict) -> dict:
+def _tensor_header_entry(strategy: str, shape: list, kwargs: dict, base_dtype: Optional[str] = None) -> dict:
     """
     Build the per-tensor JSON header entry (scalars + _ref placeholders) from shape alone.
     Mirrors what compress() returns, minus the array fields — so the header can be written
@@ -209,6 +103,8 @@ def _tensor_header_entry(strategy: str, shape: list, kwargs: dict) -> dict:
     """
     n = int(np.prod(shape)) if shape else 1
     entry: dict = {"strategy": strategy, "shape": shape, "dtype": "float32"}
+    if base_dtype is not None:
+        entry["base_dtype"] = base_dtype
 
     if strategy == "sparse":
         entry["sparsity"] = kwargs.get("sparsity", 0.9)
@@ -220,7 +116,8 @@ def _tensor_header_entry(strategy: str, shape: list, kwargs: dict) -> dict:
         outlier_fraction = kwargs.get("outlier_fraction", 0.01)
         entry["outlier_fraction"] = outlier_fraction
         entry["n_elements"] = n
-        entry["n_outliers"] = max(1, int(n * outlier_fraction))
+        entry["n_outliers"] = n_outliers_for(n, outlier_fraction)
+        entry["int4_layout"] = 2
 
     for field in _ARRAY_FIELDS.get(strategy, []):
         entry[field] = {"_ref": field}
@@ -228,20 +125,7 @@ def _tensor_header_entry(strategy: str, shape: list, kwargs: dict) -> dict:
     return entry
 
 
-def _write_array_to_file(f, name: str, field: str, arr: np.ndarray) -> None:
-    """Serialise one numpy array to a file object (no incremental checksum)."""
-    tn_enc = name.encode("utf-8")
-    fl_enc = field.encode("utf-8")
-    dt_enc = str(arr.dtype).encode("utf-8")
-    f.write(struct.pack("<I", len(tn_enc))); f.write(tn_enc)
-    f.write(struct.pack("<I", len(fl_enc))); f.write(fl_enc)
-    f.write(struct.pack("<I", len(dt_enc))); f.write(dt_enc)
-    f.write(struct.pack("<I", arr.ndim))
-    for dim in arr.shape:
-        f.write(struct.pack("<Q", dim))
-    data = arr.tobytes()
-    f.write(struct.pack("<Q", len(data)))
-    f.write(data)
+_write_array_to_file = write_array_record
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +169,7 @@ def save_delta(
             msg += f"\n  Only in base:      {sorted(only_base)}"
         raise ValueError(msg)
 
-    parent_hash = hash_state_dict(base_np)
+    parent_hash = hash_state_dict(base)
     _use_gpu = _HAS_GPU and use_gpu
 
     compressed_tensors = {}
@@ -301,6 +185,7 @@ def save_delta(
         if _use_gpu:
             delta = cp.asarray(delta)
         compressed_tensors[name] = compress(delta, strategy, **kwargs)
+        compressed_tensors[name]["base_dtype"] = dtype_name(base[name].dtype)
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,23 +229,20 @@ def save_delta_from_paths(
     Returns:
         The SHA-256 hash of the base model.
     """
-    finetuned_dir = str(finetuned_dir)
-    base_dir = str(base_dir)
+    with SafetensorsDir(finetuned_dir) as ft, SafetensorsDir(base_dir) as base:
+        return _save_delta_from_dirs(out_path, ft, base, strategy, prefetch, use_gpu, kwargs)
+
+
+def _save_delta_from_dirs(out_path, ft: SafetensorsDir, base: SafetensorsDir,
+                          strategy: str, prefetch: int, use_gpu: bool, kwargs: dict) -> str:
     _use_gpu = _HAS_GPU and use_gpu
 
-    ft_keys = set(_safetensors_keys(finetuned_dir))
-    base_keys = set(_safetensors_keys(base_dir))
-    if ft_keys != base_keys:
-        only_ft = ft_keys - base_keys
-        only_base = base_keys - ft_keys
-        msg = "Key mismatch between finetuned and base."
-        if only_ft:
-            msg += f"\n  Only in finetuned: {sorted(only_ft)}"
-        if only_base:
-            msg += f"\n  Only in base:      {sorted(only_base)}"
-        raise ValueError(msg)
-
-    all_keys = sorted(ft_keys)
+    _check_same_keys(set(ft.tensors), set(base.tensors), "finetuned", "base")
+    all_keys = ft.keys()
+    for name in all_keys:
+        if ft.tensors[name].shape != base.tensors[name].shape:
+            raise ValueError(f"Shape mismatch for '{name}': finetuned {list(ft.tensors[name].shape)} "
+                             f"vs base {list(base.tensors[name].shape)}.")
     if _use_gpu:
         _device = "GPU"
     else:
@@ -368,13 +250,13 @@ def save_delta_from_paths(
     print(f"[deltatensors] streaming {len(all_keys)} tensors (strategy={strategy}, prefetch={prefetch}, device={_device})...")
 
     # --- pass 1: build header from safetensors metadata (zero tensor I/O) ---
-    ft_meta = _safetensors_tensor_meta(finetuned_dir)
     _PLACEHOLDER_HASH = "0" * 64  # SHA-256 hex is always exactly 64 ASCII chars
     header = {
         "parent_hash": _PLACEHOLDER_HASH,
         "strategy": strategy,
         "tensors": {
-            name: _tensor_header_entry(strategy, ft_meta[name]["shape"], kwargs)
+            name: _tensor_header_entry(strategy, list(ft.tensors[name].shape), kwargs,
+                                       base.tensors[name].dtype)
             for name in all_keys
         },
     }
@@ -418,34 +300,13 @@ def save_delta_from_paths(
 
         def producer():
             try:
-                import torch
-                from safetensors import safe_open
-                from collections import defaultdict
-
-                base_kts = _build_key_to_shard(base_dir)
-                ft_kts = _build_key_to_shard(finetuned_dir)
-
-                base_shard_groups: dict = defaultdict(list)
+                # tensors are visited in sorted-name order, which is the order
+                # parent_hash covers (format v2); shard handles stay open
                 for name in all_keys:
-                    base_shard_groups[base_kts[name]].append(name)
-
-                for base_shard, skeys in base_shard_groups.items():
-                    ft_shard_groups: dict = defaultdict(list)
-                    for name in skeys:
-                        ft_shard_groups[ft_kts[name]].append(name)
-
-                    # keep base shard open across all its keys but load one tensor at a time
-                    with safe_open(f"{base_dir}/{base_shard}", framework="pt", device="cpu") as base_sf:
-                        for ft_shard, fkeys in ft_shard_groups.items():
-                            with safe_open(f"{finetuned_dir}/{ft_shard}", framework="pt", device="cpu") as ft_sf:
-                                for name in sorted(fkeys):
-                                    t = base_sf.get_tensor(name)
-                                    raw = (t.view(torch.int16).numpy() if t.dtype == torch.bfloat16
-                                           else t.numpy()).copy()
-                                    base_arr = t.to(torch.float32).numpy()
-                                    del t
-                                    ft_arr = ft_sf.get_tensor(name).to(torch.float32).numpy()
-                                    read_queue.put((name, raw, base_arr, ft_arr))
+                    raw = base.read(name)
+                    base_arr = to_float32(raw, base.tensors[name].dtype)
+                    ft_arr = to_float32(ft.read(name), ft.tensors[name].dtype)
+                    read_queue.put((name, raw, base_arr, ft_arr))
             except Exception as exc:
                 producer_error[0] = exc
             finally:
@@ -467,7 +328,7 @@ def save_delta_from_paths(
 
                 name, base_raw, base_arr, ft_arr = item
                 base_hasher.update(name.encode("utf-8"))
-                base_hasher.update(base_raw.tobytes())
+                base_hasher.update(_raw_bytes(base_raw))
                 del base_raw
 
                 delta = ft_arr.astype(np.float32) - base_arr.astype(np.float32)
@@ -505,9 +366,7 @@ def save_delta_from_paths(
     with open(out_path, "r+b") as f:
         f.seek(parent_hash_file_offset)
         f.write(parent_hash.encode("ascii"))
-        f.seek(0)
-        content = f.read()
-        f.write(hashlib.sha256(content).digest())
+    append_checksum(out_path)
 
     size_mb = os.path.getsize(out_path) / 1e6
     print(f"[deltatensors] saved {out_path.name}  ({len(all_keys)} tensors, {size_mb:.1f} MB)")
@@ -532,63 +391,20 @@ def load_delta(
     """
     base_np = _to_numpy(base)
 
-    with open(path, "rb") as f:
-        parent_hash, strategy, compressed_tensors = read_wdelta(f)
+    with WDeltaReader(path) as reader:
+        reader.verify_checksum()
+        parent_hash, strategy = reader.parent_hash, reader.strategy
+        if verify:
+            verify_base(base, parent_hash)
 
-    if verify:
-        verify_base(base_np, parent_hash)
-
-    reconstructed = {}
-    for name, payload in compressed_tensors.items():
-        if name not in base_np:
-            raise KeyError(f"Tensor '{name}' not found in base model.")
-        delta = decompress(payload)
-        base_arr = base_np[name].astype(np.float32)
-        reconstructed[name] = (base_arr + delta).astype(payload["dtype"])
-
-    print(f"[deltatensors] loaded {Path(path).name}  ({len(reconstructed)} tensors, strategy={strategy})")
-    return reconstructed
-
-def load_delta_from_paths(
-    path: Union[str, Path],
-    base_dir: Union[str, Path],
-    verify: bool = True,
-) -> Dict[str, np.ndarray]:
-    """
-    Reconstruct a fine-tuned model from a .wdelta file and a base model directory.
-    Loads each base shard once rather than once per tensor.
-
-    Args:
-        path:     Path to the .wdelta file.
-        base_dir: Folder containing base model safetensors shards.
-        verify:   SHA-256 verify the base before reconstructing (recommended).
-
-    Returns:
-        Reconstructed state dict as Dict[str, np.ndarray].
-    """
-    base_dir = str(base_dir)
-
-    with open(path, "rb") as f:
-        parent_hash, strategy, compressed_tensors = read_wdelta(f)
-
-    all_keys = list(compressed_tensors.keys())
-    base_arrays, actual_hash = _load_base_dir_numpy(base_dir, all_keys)
-
-    if verify:
-        if actual_hash != parent_hash:
-            raise ValueError(
-                f"Base model hash mismatch.\n"
-                f"  Expected : {parent_hash}\n"
-                f"  Got      : {actual_hash}\n"
-                f"Make sure you're loading the exact base model this delta was computed against."
-            )
-
-    reconstructed = {}
-    for name, payload in compressed_tensors.items():
-        base_arr = base_arrays.pop(name)  # pop to free as we go
-        delta = decompress(payload)
-        reconstructed[name] = (base_arr + delta).astype(payload["dtype"])
-        del base_arr, delta
+        reconstructed = {}
+        for name in reader.names:
+            if name not in base_np:
+                raise KeyError(f"Tensor '{name}' not found in base model.")
+            payload = reader.payload(name)
+            delta = decompress(payload)
+            base_arr = base_np[name].astype(np.float32)
+            reconstructed[name] = (base_arr + delta).astype(payload["dtype"])
 
     print(f"[deltatensors] loaded {Path(path).name}  ({len(reconstructed)} tensors, strategy={strategy})")
     return reconstructed
@@ -597,19 +413,20 @@ def inspect(path: Union[str, Path]) -> dict:
     """
     Return metadata from a .wdelta file without loading the base model.
     """
-    with open(path, "rb") as f:
-        parent_hash, strategy, compressed_tensors = read_wdelta(f)
+    with WDeltaReader(path) as reader:
+        reader.verify_checksum()
 
     size_mb = os.path.getsize(path) / 1e6
     return {
         "path": str(path),
         "size_mb": round(size_mb, 2),
-        "parent_hash": parent_hash,
-        "strategy": strategy,
-        "n_tensors": len(compressed_tensors),
+        "version": reader.version,
+        "parent_hash": reader.parent_hash,
+        "strategy": reader.strategy,
+        "n_tensors": len(reader.names),
         "tensors": {
-            name: {"shape": meta["shape"], "dtype": meta["dtype"]}
-            for name, meta in compressed_tensors.items()
+            name: {"shape": meta["shape"], "dtype": meta.get("base_dtype", meta["dtype"])}
+            for name, meta in reader.tensor_metas.items()
         },
     }
 
@@ -642,7 +459,8 @@ def inspect_chain(delta_paths: list) -> list:
 def load_delta_chain(
     delta_paths: list,
     base: Union[str, Path, "StateDict"],
-    verify: bool = True,
+    verify: Union[str, bool] = "cached",
+    num_workers: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Reconstruct the final model by applying a sequence of delta files in order.
@@ -660,7 +478,10 @@ def load_delta_chain(
         base:        Base state dict **or** path to a base safetensors directory.
                      Passing a directory uses the streaming loader for the first
                      step, which keeps RAM proportional to one model, not two.
-        verify:      Verify SHA-256 parent_hash at every step (recommended).
+        verify:      "cached" (default), "full" or "none" for the base folder (see
+                     load_delta_from_paths); later steps are always hashed
+                     in memory unless verify is "none"/False.
+        num_workers: Threads for the streaming first step.
 
     Returns:
         Reconstructed state dict at the end of the chain.
@@ -677,10 +498,13 @@ def load_delta_chain(
 
     delta_paths = [str(p) for p in delta_paths]
 
+    mode = _verify_mode(verify)
+
     if isinstance(base, (str, Path)):
-        # streaming first step: avoids loading base fully into RAM
+        # streaming first step: avoids loading base fully into RAM. Chain hashes
+        # are over float32 models, so intermediate results stay float32.
         current: Dict[str, np.ndarray] = load_delta_from_paths(
-            delta_paths[0], base, verify=verify
+            delta_paths[0], base, verify=mode, dtype="float32", num_workers=num_workers,
         )
         remaining = delta_paths[1:]
     else:
@@ -688,7 +512,7 @@ def load_delta_chain(
         remaining = delta_paths
 
     for path in remaining:
-        current = load_delta(path, current, verify=verify)
+        current = load_delta(path, current, verify=mode != "none")
 
     n = len(delta_paths)
     print(f"[deltatensors] chain: applied {n} delta(s) successfully")
@@ -745,60 +569,38 @@ def save_delta_chain_from_paths(
             outlier_fraction=0.05,
         )
     """
-    finetuned_dir = str(finetuned_dir)
-    base_dir = str(base_dir)
-    parent_delta_path = str(parent_delta_path)
+    with SafetensorsDir(finetuned_dir) as ft, SafetensorsDir(base_dir) as base:
+        return _save_chain_from_dirs(out_path, ft, str(parent_delta_path), base, strategy, use_gpu, kwargs)
+
+
+def _save_chain_from_dirs(out_path, ft: SafetensorsDir, parent_delta_path: str, base: SafetensorsDir,
+                          strategy: str, use_gpu: bool, kwargs: dict) -> str:
     out_path = Path(out_path)
     _use_gpu = _HAS_GPU and use_gpu
 
     print(f"[deltatensors] chain: streaming delta vs {Path(parent_delta_path).name}...")
 
-    # Pass 1: verify parent wdelta checksum (full read, discarded immediately after)
-    with open(parent_delta_path, "rb") as _f:
-        _raw = _f.read()
-    if hashlib.sha256(_raw[:-32]).digest() != _raw[-32:]:
-        raise ValueError(f"Parent .wdelta checksum mismatch: {parent_delta_path}")
-    del _raw
+    # Index the parent .wdelta (header + record offsets only) and verify its
+    # checksum with a streaming pass; arrays are then read by tensor name.
+    with WDeltaReader(parent_delta_path) as parent:
+        parent.verify_checksum()
+        all_keys = sorted(parent.names)
 
-    # Pass 2: parse header, then stream compressed arrays one tensor at a time
-    with open(parent_delta_path, "rb") as pf:
-        _magic = pf.read(len(MAGIC))
-        if _magic != MAGIC:
-            raise ValueError("Parent is not a valid .wdelta file (bad magic bytes)")
-        _ver = struct.unpack("<I", pf.read(4))[0]
-        if _ver != VERSION:
-            raise ValueError(f"Unsupported parent .wdelta version {_ver} (expected {VERSION})")
-        _hlen = struct.unpack("<I", pf.read(4))[0]
-        parent_header = json.loads(pf.read(_hlen).decode("utf-8"))
-        # pf is now positioned at the start of the binary array section;
-        # arrays are stored in sorted key order, matching our iteration below
-
-        parent_tensor_metas = parent_header["tensors"]
-        parent_strat = parent_header["strategy"]
-        parent_fields = _ARRAY_FIELDS.get(parent_strat, [])
-        all_keys = sorted(parent_tensor_metas.keys())
-
-        ft_keys = set(_safetensors_keys(finetuned_dir))
-        if set(all_keys) != ft_keys:
-            only_parent = set(all_keys) - ft_keys
-            only_ft = ft_keys - set(all_keys)
-            msg = "Key mismatch between parent delta and finetuned model."
-            if only_parent:
-                msg += f"\n  Only in parent delta: {sorted(only_parent)}"
-            if only_ft:
-                msg += f"\n  Only in finetuned:    {sorted(only_ft)}"
-            raise ValueError(msg)
+        _check_same_keys(set(all_keys), set(ft.tensors), "parent delta", "finetuned model")
+        missing = [k for k in all_keys if k not in base]
+        if missing:
+            raise KeyError(f"Tensors not found in base model: {missing[:10]}")
 
         print(f"[deltatensors] chain: {len(all_keys)} tensors (strategy={strategy})...")
 
         # Build output header from finetuned safetensors metadata (zero tensor I/O)
         _PLACEHOLDER_HASH = "0" * 64
-        ft_meta = _safetensors_tensor_meta(finetuned_dir)
         out_header = {
             "parent_hash": _PLACEHOLDER_HASH,
             "strategy": strategy,
             "tensors": {
-                name: _tensor_header_entry(strategy, ft_meta[name]["shape"], kwargs)
+                name: _tensor_header_entry(strategy, list(ft.tensors[name].shape), kwargs,
+                                           base.tensors[name].dtype)
                 for name in all_keys
             },
         }
@@ -817,30 +619,17 @@ def save_delta_chain_from_paths(
             out_f.write(out_header_bytes)
 
             for i, name in enumerate(all_keys):
-                # Read compressed arrays for this tensor from parent wdelta (sequential)
-                tensor_fields: dict = {}
-                for _ in parent_fields:
-                    _tn_len = struct.unpack("<I", pf.read(4))[0]; pf.read(_tn_len)
-                    _fl_len = struct.unpack("<I", pf.read(4))[0]
-                    _fl = pf.read(_fl_len).decode("utf-8")
-                    _dt_len = struct.unpack("<I", pf.read(4))[0]
-                    _dtype = np.dtype(pf.read(_dt_len).decode("utf-8"))
-                    _ndim = struct.unpack("<I", pf.read(4))[0]
-                    _shape = tuple(struct.unpack("<Q", pf.read(8))[0] for _ in range(_ndim))
-                    _dlen = struct.unpack("<Q", pf.read(8))[0]
-                    tensor_fields[_fl] = np.frombuffer(pf.read(_dlen), dtype=_dtype).reshape(_shape)
-
                 # Reconstruct parent tensor = base_tensor + decompress(parent_delta)
-                base_arr = _get_tensor_numpy(base_dir, name)
-                parent_arr = (base_arr + decompress({**parent_tensor_metas[name], **tensor_fields})).astype(np.float32)
-                del base_arr, tensor_fields
+                base_arr = to_float32(base.read(name), base.tensors[name].dtype)
+                parent_arr = (base_arr + decompress(parent.payload(name))).astype(np.float32)
+                del base_arr
 
                 # Accumulate hash of the reconstructed parent (becomes parent_hash in output)
                 parent_hasher.update(name.encode("utf-8"))
                 parent_hasher.update(parent_arr.tobytes())
 
                 # Load finetuned tensor and compute delta
-                ft_arr = _get_tensor_numpy(finetuned_dir, name)
+                ft_arr = to_float32(ft.read(name), ft.tensors[name].dtype)
                 delta = ft_arr.astype(np.float32) - parent_arr
                 del ft_arr, parent_arr
 
@@ -863,9 +652,7 @@ def save_delta_chain_from_paths(
     with open(out_path, "r+b") as out_f:
         out_f.seek(parent_hash_file_offset)
         out_f.write(parent_hash.encode("ascii"))
-        out_f.seek(0)
-        content = out_f.read()
-        out_f.write(hashlib.sha256(content).digest())
+    append_checksum(out_path)
 
     size_mb = os.path.getsize(out_path) / 1e6
     print(f"[deltatensors] saved {out_path.name}  ({len(all_keys)} tensors, {size_mb:.1f} MB)")

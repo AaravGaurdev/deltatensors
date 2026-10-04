@@ -26,8 +26,10 @@ Total                    3.9 GB    vs  11 GB naive
 
 ```bash
 pip install deltatensors
-pip install torch safetensors  # for loading from safetensors directories
+pip install torch  # optional: GPU reconstruction, hot-swapping into torch models
 ```
+
+Reading and writing safetensors folders needs only numpy.
 
 Requires Python 3.9+.
 
@@ -36,16 +38,45 @@ Requires Python 3.9+.
 ```python
 import deltatensors as dt
 
-# save delta between a fine-tuned and base model (streaming, O(1) RAM)
+# save delta between a fine-tuned and base model (streams one tensor at a time)
 dt.save_delta_from_paths("checkpoint.wdelta", "qwen-wiki/", "qwen-base/", strategy="int4")
 
-# reconstruct without loading the full base into RAM
+# rebuild the fine-tuned model as a normal HF checkpoint folder (bf16, sharded)
+dt.reconstruct_to_safetensors("qwen-base/", "checkpoint.wdelta", "qwen-wiki-rebuilt/")
+
+# or straight into memory as a state dict
 recon_sd = dt.load_delta_from_paths("checkpoint.wdelta", "qwen-base/")
 
 # inspect a delta file without a base model
 info = dt.inspect("checkpoint.wdelta")
 # {'path': 'checkpoint.wdelta', 'size_mb': 294.2, 'strategy': 'int4', 'n_tensors': 290, ...}
 ```
+
+## Reconstruction
+
+`reconstruct_to_safetensors` never holds more than a few tensors at once: each one is read, has its delta added in place and is written out before the next. Peak RAM is bounded by roughly `num_workers` x the largest tensor in float32 (one worker: the largest tensor plus a small constant), whatever the model size — for Qwen2.5-0.5B that's the 545 MB embedding. It runs across `num_workers` threads (default `min(8, cpus)`, same output for any count) and can do the math on the GPU with `device="cuda"`. Measured numbers are in [`benchmarks/results.md`](https://github.com/AaravGaurdev/deltatensors/blob/main/benchmarks/results.md).
+
+Every reconstruction checks the base model's SHA-256 against the one stored in the `.wdelta`, so you can't silently rebuild from the wrong base. The `verify` argument controls how:
+
+| `verify` | |
+|—-|—-|
+| `"cached"` (default) | hash during the pass, and remember the result keyed on path + size + mtime of every base shard; later runs against unchanged files skip the hash |
+| `"full"` | hash every time |
+| `"none"` | don't check |
+
+## Hot-swapping fine-tunes
+
+Keep one base model loaded and switch between fine-tunes in place:
+
+```python
+model = AutoModelForCausalLM.from_pretrained("qwen-base/", torch_dtype=torch.bfloat16).cuda()
+base_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+
+dt.apply_delta_(model, "math.wdelta")              # base + math
+dt.swap_delta_(model, "code.wdelta", base_state)   # base + code
+```
+
+`swap_delta_` copies the touched weights back from `base_state` and adds the new delta. It never subtracts the old one: bf16 addition isn't reversible, so subtracting would drift a little further from the base with every swap.
 
 ## Compression strategies
 
@@ -124,7 +155,7 @@ sd = dt.load_delta_chain(["v1.wdelta", "v2.wdelta"], base="base_model/")
 
 Each `.wdelta` records a `parent_hash` (SHA-256 of the model it was computed against). `load_delta_chain` verifies every link automatically — apply deltas in the wrong order and it raises `ValueError` instead of silently handing you a corrupted model.
 
-`save_delta_chain_from_paths` is fully streaming: peak RAM is O(one tensor pair), not O(two full models).
+`save_delta_chain_from_paths` streams one tensor at a time; it never reconstructs the full parent model in RAM.
 
 **Tip:** don't delete intermediate `.wdelta` files in a chain — reconstructing v5 means replaying v1 through v5 in order. If you need v5 to stand alone, save it as a flat delta against base instead.
 

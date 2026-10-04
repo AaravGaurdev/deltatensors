@@ -30,3 +30,6 @@ build/
 # readthedocs/mkdocs
 site/
 
+
+# v1 format fixtures (written by 0.2.0, must stay committed)
+!tests/fixtures/**/*.wdelta

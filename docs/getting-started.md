@@ -4,7 +4,7 @@
 
 ```bash
 pip install deltatensors
-pip install torch safetensors  # for loading from safetensors directories
+pip install torch  # optional: GPU reconstruction, hot-swapping into torch models
 ```
 
 Requires Python 3.9+.
@@ -27,45 +27,51 @@ dt.save_delta_from_paths(
 
 This streams tensor pairs from disk one at a time — peak RAM is O(1 tensor), not O(two full models). For models that fit comfortably in RAM, see [in-memory usage](#in-memory-usage-small-models).
 
-### Reconstruct
+### Reconstruct to a model folder
 
 ```python
-recon_sd = dt.load_delta_from_paths(
+dt.reconstruct_to_safetensors(
+    "qwen-base/",          # base model directory
     "checkpoint.wdelta",
-    "qwen-base/",
-    verify=True,
+    "qwen-wiki-rebuilt/",  # output: safetensors shards + index + config/tokenizer
+    dtype="bfloat16",      # or "float16", "float32", None (keep the base's dtypes)
 )
 ```
 
-Returns a `Dict[str, np.ndarray]`. `verify=True` checks the base model's SHA-256 hash against the one stored in the `.wdelta` file — recommended, since applying a delta to the wrong base produces garbage silently.
+The output folder is a normal Hugging Face checkpoint: `AutoModelForCausalLM.from_pretrained("qwen-wiki-rebuilt/")` loads it. Tensors stream through one at a time, so peak RAM stays around the size of the largest tensor in float32 per worker, regardless of model size.
 
-### Load into a HuggingFace model
+### Reconstruct into memory
 
-`load_delta_from_paths` gives you a numpy state dict. To run inference you need to patch it into a model. The trick is to do it in-place so you don't hold a full second copy in RAM:
+```python
+recon_sd = dt.load_delta_from_paths("checkpoint.wdelta", "qwen-base/")
+```
+
+Returns a `Dict[str, np.ndarray]` in the base's dtypes (bfloat16 comes back as float32, since numpy has no bfloat16; pass `dtype="bfloat16"` to get torch bfloat16 tensors instead). The base is never loaded whole, but the result is a full model in RAM.
+
+Both functions verify the base model's SHA-256 against the `parent_hash` stored in the `.wdelta`, because applying a delta to the wrong base produces garbage silently. With the default `verify="cached"`, the hash is computed during the reconstruction pass and remembered (keyed on each base shard's path, size and mtime), so reconstructing more fine-tunes of the same base skips it. `verify="full"` hashes every time; `verify="none"` skips the check.
+
+### Apply to a loaded model (and hot-swap)
+
+To run a fine-tune without writing it out, load the base once and add the delta in place:
 
 ```python
 from transformers import AutoModelForCausalLM
-from deltatensors.format import read_wdelta
-from deltatensors.compress import decompress
 import torch
 
-model = AutoModelForCausalLM.from_pretrained("qwen-base/", dtype=torch.float32)
-sd = model.state_dict()
-
-with open("checkpoint.wdelta", "rb") as f:
-    _, _, compressed_tensors = read_wdelta(f)
-
-for name, payload in compressed_tensors.items():
-    if name not in sd:
-        continue
-    delta = torch.from_numpy(decompress(payload))
-    sd[name].add_(delta.to(sd[name].dtype))
-    del delta
-
-model.load_state_dict(sd, strict=False)
+model = AutoModelForCausalLM.from_pretrained("qwen-base/", torch_dtype=torch.bfloat16).cuda()
+dt.apply_delta_(model, "checkpoint.wdelta")
 ```
 
-Peak RAM here is one loaded model + one delta tensor at a time.
+This works tensor by tensor on the parameters' device, so the extra memory is one float32 tensor at a time. To switch between fine-tunes, keep a copy of the base weights and swap:
+
+```python
+base_state = {k: v.detach().clone() for k, v in model.state_dict().items()}  # GPU or CPU
+
+dt.apply_delta_(model, "math.wdelta")
+dt.swap_delta_(model, "code.wdelta", base_state)
+```
+
+`swap_delta_` restores every touched weight from `base_state` before adding the new delta. Don't undo a delta by subtracting it: bf16 addition isn't reversible, and the error accumulates with every swap.
 
 ### Inspect without loading anything
 
@@ -78,7 +84,7 @@ info = dt.inspect("checkpoint.wdelta")
 #   'strategy': 'int4',
 #   'n_tensors': 290,
 #   'tensors': {
-#     'model.embed_tokens.weight': {'shape': [151936, 896], 'dtype': 'float32'},
+#     'model.embed_tokens.weight': {'shape': [151936, 896], 'dtype': 'bfloat16'},
 #     ...
 #   }
 # }
@@ -190,7 +196,7 @@ dt.save_delta_chain_from_paths(
 )
 ```
 
-`save_delta_chain_from_paths` is fully streaming — it reads the parent `.wdelta` one tensor at a time without ever reconstructing the full parent model in RAM.
+`save_delta_chain_from_paths` is streaming — it reads the parent `.wdelta` one tensor at a time without ever reconstructing the full parent model in RAM.
 
 ### Inspect chain metadata
 
@@ -209,11 +215,11 @@ Returns a list of dicts with the same fields as `inspect()` plus a `step` index.
 sd = dt.load_delta_chain(
     ["v1.wdelta", "v2.wdelta"],
     base="base_model/",
-    verify=True,   # verifies parent_hash at each step
+    verify="cached",   # verifies parent_hash at each step
 )
 ```
 
-With `verify=True`, applying deltas in the wrong order raises `ValueError: hash mismatch` immediately. Pass a directory path for `base` (uses the streaming loader for the first step) or an in-memory state dict.
+The result is float32: chain hashes are defined over float32 models, so intermediate steps stay float32. Applying deltas in the wrong order raises `ValueError: hash mismatch` immediately. Pass a directory path for `base` (uses the streaming loader for the first step) or an in-memory state dict.
 
 ### Flat vs chained
 

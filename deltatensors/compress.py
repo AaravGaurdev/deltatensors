@@ -149,6 +149,56 @@ def compress(delta: np.ndarray, strategy: str, **kwargs) -> Dict[str, Any]:
         raise ValueError(f"Unknown strategy '{strategy}'. Choose 'sparse', 'quantized', or 'int4'.")
 
 
+_ROW_CHUNK_ELEMS = 1 << 20
+
+
+def _sparse_add_(payload: Dict[str, Any], flat: np.ndarray) -> None:
+    flat[payload["indices"]] += np.asarray(payload["values"]).astype(np.float32, copy=False)
+
+
+def _quantized_add_(payload: Dict[str, Any], flat: np.ndarray) -> None:
+    n_elements = payload["n_elements"]
+    n_cols = payload["n_cols"]
+    n_rows = n_elements // n_cols
+    mat = flat.reshape(n_rows, n_cols)
+    scales = payload["scales"].astype(np.float32)
+    packed = payload["packed_signs"]
+    # rows per chunk, keeping the per-chunk temporaries around _ROW_CHUNK_ELEMS
+    step = max(1, _ROW_CHUNK_ELEMS // max(1, n_cols))
+    for r0 in range(0, n_rows, step):
+        r1 = min(n_rows, r0 + step)
+        start, count = r0 * n_cols, (r1 - r0) * n_cols
+        b0 = start // 8
+        bits = np.unpackbits(packed[b0:(start + count + 7) // 8])
+        bits = bits[start - 8 * b0:start - 8 * b0 + count].reshape(r1 - r0, n_cols)
+        s = scales[r0:r1, np.newaxis]
+        # same float32 values as decompress_quantized: sign * scale
+        mat[r0:r1] += np.where(bits.astype(bool), s, -s)
+
+
+def decompress_add_(payload: Dict[str, Any], out: np.ndarray) -> np.ndarray:
+    """
+    out += delta, in place, for any strategy. ``out`` must be a C-contiguous
+    float32 array with the tensor's element count (typically the base tensor).
+    Bit-identical to ``out + decompress(payload)``.
+    """
+    if out.dtype != np.float32 or not out.flags.c_contiguous:
+        raise ValueError("out must be a C-contiguous float32 array")
+    strategy = payload["strategy"]
+    if strategy == "int4":
+        from .compress_int4 import decompress_int4_add_
+        decompress_int4_add_(payload, out)
+        return out
+    flat = out.reshape(-1)
+    if strategy == "sparse":
+        _sparse_add_(payload, flat)
+    elif strategy == "quantized":
+        _quantized_add_(payload, flat)
+    else:
+        raise ValueError(f"Unknown strategy '{strategy}' in payload.")
+    return out
+
+
 def decompress(payload: Dict[str, Any]) -> np.ndarray:
     strategy = payload["strategy"]
     if strategy == "sparse":
