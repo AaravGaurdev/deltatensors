@@ -89,7 +89,7 @@ def n_params(cfg):
     return sum(int(np.prod(s)) for s in model_shapes(cfg).values())
 
 
-def build_model(size, root: Path, log):
+def build_model(size, root: Path, log, timeout: float):
     """Write base/ and the two .wdelta files for one size; reuse if present."""
     from deltatensors.safetensors_io import ShardedWriter, f32_to_bf16
 
@@ -119,9 +119,7 @@ def build_model(size, root: Path, log):
     _quiet(lambda: __import__("deltatensors").save_delta_from_paths(
         v2, d / "ft", d / "base", strategy="int4", outlier_fraction=0.01))
     log(f"[{size}] writing v1 delta (deltatensors 0.2.0)")
-    old = import_old(root)
-    _quiet(lambda: old.save_delta_from_paths(v1, str(d / "ft"), str(d / "base"), strategy="int4",
-                                              outlier_fraction=0.01))
+    run_child({"mode": "write_v1", "dir": str(d), "root": str(root)}, timeout)
     shutil.rmtree(d / "ft")
     return d
 
@@ -199,6 +197,12 @@ def child(spec: dict) -> dict:
 
     if mode == "compute":
         return compute_only(spec)
+    if mode == "write_v1":
+        old = import_old(Path(spec["root"]))
+        with _redirect():
+            old.save_delta_from_paths(str(d / "delta_v1.wdelta"), str(d / "ft"), str(d / "base"),
+                                      strategy="int4", outlier_fraction=0.01)
+        return {}
 
     # import everything the path needs before the baseline is taken
     if mode == "old_load":
@@ -278,25 +282,62 @@ def compute_only(spec: dict) -> dict:
     return {"elements": total, "tensors": len(names), "pinned": pinned, **{f"{k}_s": v for k, v in best.items()}}
 
 
+class ChildFailed(RuntimeError):
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(reason)
+        self.detail = detail
+
+
 def run_child(spec: dict, timeout: float) -> dict:
     cmd = [sys.executable, str(Path(__file__).resolve()), "--child", json.dumps(spec)]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ChildFailed(f"timed out after {timeout:.0f} s") from None
     for line in p.stdout.splitlines():
         if line.startswith(MARK):
             return json.loads(line[len(MARK):])
-    raise RuntimeError(f"child failed ({spec['mode']}):\n{p.stdout[-2000:]}\n{p.stderr[-4000:]}")
+    # SIGKILL from the OOM killer shows up as -9 (137 through a shell)
+    reason = "killed, likely out of memory" if p.returncode in (-9, 137) else f"exit code {p.returncode}"
+    raise ChildFailed(reason, f"{p.stdout[-2000:]}\n{p.stderr[-4000:]}")
 
 
 # ---------------------------------------------------------------------------
 # orchestration
 # ---------------------------------------------------------------------------
 
+def cgroup_memory():
+    """(limit, bytes in use excluding page cache) for this container, or None.
+
+    Inside a container psutil reports the whole machine's RAM, not the pod's
+    limit, so the RAM checks alone would start runs the OOM killer then ends.
+    """
+    for limit_f, usage_f, cache_key in (
+            ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "file"),  # cgroup v2
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+             "total_cache")):  # cgroup v1
+        try:
+            limit = Path(limit_f).read_text().strip()
+            usage = int(Path(usage_f).read_text())
+            if limit == "max" or int(limit) >= 1 << 60:
+                return None
+            stat = dict(line.split()[:2] for line in (Path(limit_f).parent / "memory.stat").read_text().splitlines())
+            return int(limit), usage - int(stat.get(cache_key, 0))
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def available_ram() -> float:
     try:
         import psutil
-        return psutil.virtual_memory().available
+        avail = psutil.virtual_memory().available
     except ImportError:
-        return float("inf")
+        avail = float("inf")
+    cg = cgroup_memory()
+    if cg:
+        avail = min(avail, cg[0] - cg[1])
+    return avail
 
 
 def machine_info() -> dict:
@@ -314,6 +355,10 @@ def machine_info() -> dict:
         info["ram_available_gb_at_start"] = round(psutil.virtual_memory().available / 1e9, 1)
     except ImportError:
         pass
+    cg = cgroup_memory()
+    if cg:
+        info["container_memory_limit_gb"] = round(cg[0] / 1e9, 1)
+        info["ram_available_gb_at_start"] = round(available_ram() / 1e9, 1)
     try:
         import torch
         info["torch"] = torch.__version__
@@ -375,6 +420,12 @@ def main():
     info["workers_N"] = workers
     results, notes = [], []
 
+    def failed(size, what, e: ChildFailed):
+        notes.append(f"{size}: {what} failed ({e}).")
+        log(notes[-1])
+        if e.detail:
+            log(e.detail)
+
     try:
         for size in sizes:
             cfg = CONFIGS[size]
@@ -386,7 +437,12 @@ def main():
                              f"{gb(free_disk)} GB available.")
                 log(notes[-1])
                 continue
-            d = build_model(size, root, log)
+            try:
+                d = build_model(size, root, log, args.timeout)
+            except ChildFailed as e:
+                failed(size, "writing the v1 delta with 0.2.0", e)
+                shutil.rmtree(root / size, ignore_errors=True)
+                continue
             row = {"size": size, "params": P, "largest": largest,
                    "v1_mb": (d / "delta_v1.wdelta").stat().st_size / 1e6,
                    "v2_mb": (d / "delta_v2.wdelta").stat().st_size / 1e6, "runs": []}
@@ -397,8 +453,11 @@ def main():
 
             if not args.no_old:
                 log(f"[{size}] compute-only, one core")
-                row["compute"] = run_child(dict(base_spec, mode="compute", core=args.core, repeats=3,
-                                                elements=args.compute_elements), args.timeout)
+                try:
+                    row["compute"] = run_child(dict(base_spec, mode="compute", core=args.core, repeats=3,
+                                                    elements=args.compute_elements), args.timeout)
+                except ChildFailed as e:
+                    failed(size, "compute-only comparison", e)
 
             runs = []
             # 0.2.0 holds the base and the output as float32 dicts plus the whole file
@@ -442,25 +501,34 @@ def main():
 
             for label, spec in runs:
                 spec = dict(base_spec, **spec, out=str(out))
-                if spec.pop("warm", False):
-                    shutil.rmtree(cache, ignore_errors=True)
-                    run_child(dict(spec, verify="cached"), args.timeout)  # populate the cache
+                try:
+                    if spec.pop("warm", False):
+                        shutil.rmtree(cache, ignore_errors=True)
+                        run_child(dict(spec, verify="cached"), args.timeout)  # populate the cache
+                        shutil.rmtree(out, ignore_errors=True)
+                    log(f"[{size}] {label}")
+                    r = run_child(spec, args.timeout)
+                except ChildFailed as e:
+                    failed(size, label, e)
                     shutil.rmtree(out, ignore_errors=True)
-                log(f"[{size}] {label}")
-                r = run_child(spec, args.timeout)
+                    continue
                 shutil.rmtree(out, ignore_errors=True)
                 if not args.no_tracemalloc:
-                    r["tracemalloc_peak"] = run_child(dict(spec, tracemalloc=True), args.timeout)["tracemalloc_peak"]
+                    try:
+                        r["tracemalloc_peak"] = run_child(dict(spec, tracemalloc=True),
+                                                          args.timeout)["tracemalloc_peak"]
+                    except ChildFailed as e:
+                        failed(size, f"{label} (tracemalloc run)", e)
                     shutil.rmtree(out, ignore_errors=True)
                 r["label"] = label
                 row["runs"].append(r)
                 log(f"    {r['wall_s']:.1f} s, peak RSS {gb(r['peak_rss'])} GB")
     finally:
+        # written even if the benchmark itself crashes, so finished runs aren't lost
+        write_results(Path(args.results), info, results, notes)
+        log(f"wrote {args.results}")
         if not args.keep:
             shutil.rmtree(root, ignore_errors=True)
-
-    write_results(Path(args.results), info, results, notes)
-    log(f"wrote {args.results}")
 
 
 def write_results(path: Path, info: dict, results: list, notes: list) -> None:
@@ -496,7 +564,7 @@ def write_results(path: Path, info: dict, results: list, notes: list) -> None:
                      f"{gb(r['peak_rss'] - r['baseline_rss'])} | {tm} |")
         L.append("")
     if notes:
-        L += ["## Skipped", ""] + [f"- {n}" for n in notes] + [""]
+        L += ["## Skipped or failed", ""] + [f"- {n}" for n in notes] + [""]
     path.write_text("\n".join(L), encoding="utf-8")
 
 
